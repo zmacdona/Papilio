@@ -1,0 +1,314 @@
+############### dodi workflow ################
+
+Slurm commands: 
+sbatch my_name.sh                #start job
+squeue -u zmac                   #check job        
+scancel jobID                    #cancel job
+
+
+#### DATA PROCESSING AND GENOTYPING IN STACKS ####
+
+####
+###### Step one: unzip and concatenate the 4 files for each N7XX index (usually labelled as L001-L004):
+
+gzip -d *  ## do this for each of the 4 .fastq files for each index, then:
+
+cat * > N7XX_lanes1-4.fastq  ## can also specify files individually separated by a space if in a common directory.
+ 
+
+
+
+
+
+
+####
+###### Step two: Demultiplex the data using process_radtags in Stacks, which is installed on Compute Canada's Cedar cluster:
+
+module load nixpkgs/16.09 gcc/5.4.0 stacks/2.0b  ## loads stacks on Cedar
+
+process_radtags -- help
+
+process_radtags -f /home/zmac/scratch/N720_individuals/N720_lanes1-4.fastq \
+-b /home/zmac/scratch/N720_individuals/N720_barcode_file.txt --renz_1 pstI \
+--inline_null -t 67 -w 0.15 -s 20 -c -r -D --filter_illumina -E phred33 \
+-o /home/zmac/scratch/demultiplexed_seqs_pstI
+
+
+## With barcode rescue (-r) about 75-85% of raw reads were retained. 
+## Barcode rescue allows for 1 mismatch in barcode and/or RE site sequence
+
+
+
+
+
+####
+###### Step three: Search for remnant Illumina adaptor sequences and remove affected reads in cutadapt using loop:
+
+module load python/3.5.4 ## loads python on Cedar
+
+virtualenv ENV ## creating a virtual environment to access cutadapt
+
+source ENV/bin/activate ## activating virtual environment (type "deactivate" to deactivate)
+
+pip install cutadapt ## use the pip installer to install cutadapt locally
+
+## should see a list of options for running program
+
+## path to cutadapt: /home/zmac/scratch/demultiplexed_seqs_pstI/ENV/bin/cutadapt
+
+
+## now run this loop to 
+
+for fname in /home/zmac/scratch/demultiplexed_seqs_pstI/*.fq
+do
+
+/home/zmac/scratch/demultiplexed_seqs_pstI/ENV/bin/cutadapt -u 5 -a ACCGAGATCGGAAGAGCACACGTCTGAACTCCAGTCACNNNNNNNNATC -m 62 -o "${fname%.fq}.fastq" "$fname" &
+
+done
+
+## make sure to remove pstI site on 5' end (-u 5), as there is sometimes sequencing error in the cut site, causing false SNPs
+### After ~4 hrs, this ended in a broken pipe. It looks like the job finished, but if something looks wrong, likely happened here. 
+
+## move fast files to a new folder "trimmed_seqs"
+
+
+
+
+
+
+
+####
+###### Step four: Align cleaned reads to the machaon genome using bwa:
+
+## First, create reference index called "machaon" using the genome (should only have to do once if you keep the files):
+
+module load bwa/0.7.17
+
+bwa index -p machaon -a bwtsw /home/zmac/scratch/GCF_001298355.1_Pap_ma_1.0_genomic.fna
+
+
+## Then, use mem to align reads to the reference and output .sam files:
+
+bwa mem machaon 11401_Milk_RGE51.fastq > 11401_Milk_RGE51.sam
+
+
+## or you can use a loop to align all files to reference with a single command:
+
+
+module load bwa/0.7.17
+
+for fname in ./*.fastq
+
+do
+
+bwa mem machaon $fname > ${fname%.fastq}.sam
+
+done
+
+
+
+###### Step five: Quality check the bwa alignment, sort, and convert sam to bam using samtools:
+
+module load samtools/1.9
+
+## to see a list of options type:
+samtools help
+
+## to see how many reads aligned in each file (optional, but should check in case you need to tweak bwa):
+
+samtools flagstat sample_name.sam
+
+## this should output something like this:
+## 1051168 + 0 in total (QC-passed reads + QC-failed reads)
+## 0 + 0 secondary
+## 3092 + 0 supplementary
+## 0 + 0 duplicates
+## 948073 + 0 mapped (90.19% : N/A)
+## 0 + 0 paired in sequencing
+## 0 + 0 read1
+## 0 + 0 read2
+## 0 + 0 properly paired (N/A : N/A)
+## 0 + 0 with itself and mate mapped
+## 0 + 0 singletons (N/A : N/A)
+## 0 + 0 with mate mapped to a different chr
+## 0 + 0 with mate mapped to a different chr (mapQ>=5)
+
+##### if only ~ 50% of the reads are mapping to the reference using bwa may mean shitty reference genome -- most look really good
+
+
+## convert sam files to bam format and sort (use Slurm):
+
+module load samtools/1.9
+# mkdir sorted_bams ## make directory to dump sorted bags into
+
+for fname in ./*.sam;
+
+do
+
+samtools view -bS $fname |
+samtools sort > sorted_bams/${fname%.sam}.bam
+
+done
+
+
+
+
+########## Zac's code ###########
+module load bwa/0.7.17
+
+# bwa index -p machaon -a bwtsw /home/zmac/scratch/GCF_001298355.1_Pap_ma_1.0_genomic.fna
+
+for fname in ./*.fastq
+
+do
+
+bwa mem machaon $fname | samtools view -b > $fname.bam | samtools sort > $./sorted_bams/$fname.bam
+
+done
+
+########## I think this does the same thing as steps 4 and 5, no?
+
+
+
+
+###### Step 6: run the ref_map.pl script in Stacks:
+
+module load nixpkgs/16.09 gcc/5.4.0 stacks/2.0b
+
+ref_map.pl --samples /home/zmac/scratch/demultiplexed_seqs_pstI/trimmed_seqs/sorted_bams \
+--popmap /home/zmac/scratch/demultiplexed_seqs_pstI/trimmed_seqs/population_map_single.txt \
+-o /home/zmac/scratch/stacks_out \
+-X "gstacks:--max-clipped 0" \
+-X "populations: -p 1 -r 0.1 --min_maf 0.05 --write_random_snp --hwe --vcf"
+
+# Felix recomeneded using maf of 5%
+
+
+
+
+
+###### Here is Julian's code (modified):
+ref_map.pl --samples ./BWA_mem_Dsuz -o ./Stacks_out -T 32 --popmap ./all_Dsuz_popmap.txt -X "populations: -p 10 -r 0.75 --write_random_snp --ordered_export --vcf"
+
+# notes from Julian: Pretty minimal filtering, but this is a very evenly sampled popgen dataset, so I'm using population-specific filters in the populations command (-p and -r). For a first run, I'd say use -p 1 -r 0.01. I was just helping somebody else out with learning stacks, and here's another somewhat commented version of my steps after demultiplexing:
+
+# my code given Julian's recomendations:
+ref_map.pl --samples ./ -o /home/zmac/scratch/dodi_analysis_practice --popmap /home/zmac/scratch/demultiplexed_seqs_pstI/trimmed_seqs/pop_map_delete.txt -X "populations: -p 1 -r 0.01 --write_random_snp --ordered_export --vcf"
+
+
+#### vcf tools code (modified from Julian's original code)
+
+module load nixpkgs/16.09 intel/2016.4 vcftools/0.1.14
+
+vcftools --vcf batch_1.vcf --min-alleles 2 --max-alleles 2 --max-missing 0.5 --missing-indv --maf 0.05 --out batch_1_0.5miss
+
+--minDP 10 # including this drops all F_MISS values to 0 in the output... don't include for now. Can filter for depth later on. 
+
+
+## Most of the individuals have less than 0.5 missing data--probably a good cutoff to use for the moment. Now need to create a list of individuals with more than 50% missing data. Can use awk to do it--my code:
+
+awk -F'\t' '$5 > 0.5' batch_1_0.5miss.imiss | cut -f1 > batch_1_remove_inds.txt
+
+# or
+vcftools --vcf populations.snps.vcf --max-missing 0.8 --remove batch_1_remove_inds.txt --minDP 5 --maf 0.05 --thin 10000 --recode --out batch_1_BadIndsRmvd
+
+# Parameters as interpreted:
+	--vcf populations.snps.vcf
+	--exclude batch_1_remove_inds.txt
+	--maf 0.05
+	--minDP 5
+	--thin 10000
+	--max-missing 0.8
+	--out batch_1_BadIndsRmvd
+	--recode
+
+# Excluding individuals in 'exclude' list
+# After filtering, kept 185 out of 191 Individuals
+# Outputting VCF file...
+# After filtering, kept 3756 out of a possible 26436 Sites
+
+
+
+
+#### making different datasets for PCAs:
+
+## removing the 8 outliers from PCA
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_PCA_outliers.txt --recode --out batch_1_Bad_Outliers_IndsRmvd
+
+## removing all larvae 
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_larvae.txt --recode --out batch_1_Adults_only_BadIndsRmvd
+
+## removing all adults 
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_adults.txt --recode --out batch_1_Larvae_only_BadIndsRmvd
+
+
+
+
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --max-missing 0.2
+   
+# After filtering, kept 185 out of 185 Individuals
+# After filtering, kept 20614 out of a possible 26436 Sites
+vcftools --vcf Alud_world_BadIndsRmvd.recode.vcf --max-missing 0.8 --maf 0.01 --recode --out Alud_world_BadIndsRmvd_0.2miss_0.01maf
+
+
+
+
+
+
+
+
+
+
+
+### multiple pops vcf code
+
+module load nixpkgs/16.09 intel/2016.4 vcftools/0.1.14
+
+vcftools --vcf populations.snps.vcf --min-alleles 2 --max-alleles 2 --max-missing 0.5 --missing-indv --maf 0.05 --out batch_1_0.5miss
+
+--minDP 10 # including this drops all F_MISS values to 0 in the output... don't include for now. Can filter for depth later on. 
+
+
+## Most of the individuals have less than 0.5 missing data--probably a good cutoff to use for the moment. Now need to create a list of individuals with more than 50% missing data. Can use awk to do it--my code:
+
+awk -F'\t' '$5 > 0.5' batch_1_0.5miss.imiss | cut -f1 > batch_1_remove_inds.txt
+
+vcftools --vcf batch_1.vcf --max-missing 0.8 --remove batch_1_remove_inds.txt --minDP 5 --maf 0.05 --thin 10000 --recode --out batch_1_BadIndsRmvd_multiple_pops
+
+# Parameters as interpreted:
+	--vcf populations.snps.vcf
+	--exclude batch_1_remove_inds.txt
+	--maf 0.05
+	--minDP 5
+	--thin 10000
+	--max-missing 0.8
+	--out batch_1_BadIndsRmvd
+	--recode
+
+# Excluding individuals in 'exclude' list
+# After filtering, kept 185 out of 191 Individuals
+# Outputting VCF file...
+# After filtering, kept 3756 out of a possible 26436 Sites
+
+
+
+
+#### making different datasets for PCAs:
+
+## removing the 8 outliers from PCA
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_PCA_outliers.txt --recode --out batch_1_Bad_Outliers_IndsRmvd
+
+## removing all larvae 
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_larvae.txt --recode --out batch_1_Adults_only_BadIndsRmvd
+
+## removing all adults 
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --remove batch_1_remove_adults.txt --recode --out batch_1_Larvae_only_BadIndsRmvd
+
+
+
+
+vcftools --vcf batch_1_BadIndsRmvd.recode.vcf --max-missing 0.2
+   
+# After filtering, kept 185 out of 185 Individuals
+# After filtering, kept 20614 out of a possible 26436 Sites
+vcftools --vcf Alud_world_BadIndsRmvd.recode.vcf --max-missing 0.8 --maf 0.01 --recode --out Alud_world_BadIndsRmvd_0.2miss_0.01maf
